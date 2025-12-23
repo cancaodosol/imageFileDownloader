@@ -1,0 +1,4 @@
+*.csv
+downloads/*
+logs/failed.log
+logs/success.log
