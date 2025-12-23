@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 target.csvを読み込み、2列目の画像URLをdownloads/に保存するスクリプト。
+成功した保存ファイル名をsuccess.logに記録し、同名ファイルはスキップする。
 """
 
 from __future__ import annotations
 
 import csv
-import itertools
 import mimetypes
 import os
 import re
@@ -36,18 +36,6 @@ def sanitize_filename(name: str) -> str:
     return cleaned or "unnamed"
 
 
-def ensure_unique_path(base: Path, suffix: str) -> Path:
-    """
-    既存と衝突しないパスを返す（必要なら連番を付与）。
-    例: base="file", suffix=".jpg" -> "file.jpg", "file_1.jpg", ...
-    """
-    candidate = base.with_suffix(suffix)
-    for idx in itertools.count(1):
-        if not candidate.exists():
-            return candidate
-        candidate = base.with_name(f"{base.name}_{idx}").with_suffix(suffix)
-
-
 def guess_extension(url: str, content_type: Optional[str]) -> str:
     """URLかContent-Typeから拡張子を推定する。"""
     parsed = urlparse(url)
@@ -61,6 +49,27 @@ def guess_extension(url: str, content_type: Optional[str]) -> str:
     return ".bin"
 
 
+def build_base_and_ext(name: str, url: str) -> tuple[str, str]:
+    """保存ファイルのベース名と拡張子を決定する（ダウンロード前に判定）。"""
+    parsed = urlparse(url)
+    orig_filename = Path(parsed.path).name
+
+    if orig_filename:
+        safe_name = sanitize_filename(orig_filename)
+        base = Path(safe_name).stem
+        ext = Path(safe_name).suffix
+    else:
+        safe_name = sanitize_filename(name or "image")
+        base = safe_name
+        ext = ""
+
+    if not ext:
+        ext = guess_extension(url, None)
+    if not ext.startswith("."):
+        ext = f".{ext}"
+    return base, ext
+
+
 def append_log(path: Path, message: str) -> None:
     """ログファイルに1行追記する。"""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,37 +77,48 @@ def append_log(path: Path, message: str) -> None:
         fp.write(f"{message}\n")
 
 
-def load_logged_urls(path: Path) -> set[str]:
-    """既存のログからURLの集合を読み込む（ファイルが無ければ空集合）。"""
+def load_logged_names(path: Path) -> set[str]:
+    """
+    既存のログから保存ファイル名の集合を読み込む（ファイルが無ければ空集合）。
+    過去ログがURL形式の場合も、パス部分からファイル名を抽出して併せて登録する。
+    """
     if not path.exists():
         return set()
+    names: set[str] = set()
     with path.open("r", encoding="utf-8") as fp:
-        return {line.strip() for line in fp if line.strip()}
+        for raw in fp:
+            line = raw.strip()
+            if not line:
+                continue
+            names.add(line)
+            parsed = urlparse(line)
+            url_name = Path(parsed.path).name
+            if url_name:
+                names.add(sanitize_filename(url_name))
+    return names
 
 
-def download_file(name: str, url: str) -> Optional[Path]:
+def download_file(name: str, url: str, base: str, ext: str) -> Optional[Path]:
     """1ファイルをダウンロードし、保存パスを返す（失敗時はNone）。"""
-    parsed = urlparse(url)
-    orig_filename = Path(parsed.path).name
-    if orig_filename:
-        safe_name = sanitize_filename(orig_filename)
-        base = Path(safe_name).stem
-    else:
-        safe_name = sanitize_filename(name or "image")
-        base = safe_name
     try:
         req = Request(url, headers={"User-Agent": USER_AGENT})
         with urlopen(req, timeout=30) as response:
             content_type = response.headers.get("Content-Type")
-            ext = Path(safe_name).suffix or guess_extension(url, content_type)
-            target_path = ensure_unique_path(DOWNLOAD_DIR / base, ext)
+            resolved_ext = ext or guess_extension(url, content_type)
+            if not resolved_ext.startswith("."):
+                resolved_ext = f".{resolved_ext}"
+            target_path = (DOWNLOAD_DIR / f"{base}{resolved_ext}")
             target_path.parent.mkdir(parents=True, exist_ok=True)
+            if target_path.exists():
+                print(f"[SKIP] {name or base} <- {url} (同名ファイルが既に存在)")
+                append_log(SUCCESS_LOG, target_path.name)
+                return None
             with target_path.open("wb") as fp:
                 fp.write(response.read())
-            append_log(SUCCESS_LOG, url)
+            append_log(SUCCESS_LOG, target_path.name)
             return target_path
     except (HTTPError, URLError, ContentTooShortError, TimeoutError) as exc:
-        print(f"[NG] {safe_name} <- {url} ({exc})")
+        print(f"[NG] {name or base} <- {url} ({exc})")
         append_log(FAILED_LOG, f"{url} ({exc})")
         return None
 
@@ -119,17 +139,26 @@ def main() -> None:
     if not CSV_PATH.exists():
         raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
 
-    already_success = load_logged_urls(SUCCESS_LOG)
+    already_success = load_logged_names(SUCCESS_LOG)
     total = 0
     saved = 0
 
     for total, (name, url) in enumerate(iter_csv_rows(CSV_PATH), start=1):
-        if url in already_success:
-            print(f"[SKIP] {name} <- {url} (success.logに記録済み)")
+        base, ext = build_base_and_ext(name, url)
+        candidate_name = f"{base}{ext}"
+        candidate_path = DOWNLOAD_DIR / candidate_name
+        if candidate_name in already_success:
+            print(f"[SKIP] {name} <- {url} (success.logに記録済みファイル名)")
             continue
-        path = download_file(name, url)
+        if candidate_path.exists():
+            print(f"[SKIP] {name} <- {url} (同名ファイルが既に存在)")
+            append_log(SUCCESS_LOG, candidate_name)
+            already_success.add(candidate_name)
+            continue
+        path = download_file(name, url, base, ext)
         if path:
             saved += 1
+            already_success.add(path.name)
             print(f"[OK] {name} -> {path}")
         # 50件ごとに少し長めの休憩を入れる
         if total % BATCH_PAUSE_EVERY == 0:
