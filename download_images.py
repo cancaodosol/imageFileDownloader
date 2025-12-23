@@ -6,6 +6,7 @@ target.csvを読み込み、2列目の画像URLをdownloads/に保存するス�
 
 from __future__ import annotations
 
+import argparse
 import csv
 import mimetypes
 import os
@@ -135,9 +136,23 @@ def iter_csv_rows(csv_path: Path):
             yield name, url
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="画像ダウンロードスクリプト")
+    parser.add_argument(
+        "--dry-run",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="実際のダウンロードを行わず予定のみ表示する（デフォルトは本番ダウンロード）",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     if not CSV_PATH.exists():
         raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
+
+    args = parse_args()
+    dry_run = args.dry_run
 
     already_success = load_logged_names(SUCCESS_LOG)
     total = 0
@@ -154,6 +169,9 @@ def main() -> None:
             print(f"[SKIP] {name} <- {url} (同名ファイルが既に存在)")
             append_log(SUCCESS_LOG, candidate_name)
             already_success.add(candidate_name)
+            continue
+        if dry_run:
+            print(f"[DRY-RUN] {name} -> {candidate_path}")
             continue
         path = download_file(name, url, base, ext)
         if path:
